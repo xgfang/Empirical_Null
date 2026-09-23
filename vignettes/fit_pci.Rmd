@@ -1,0 +1,434 @@
+---
+title: "Provider inference with fit_pci"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Provider inference with fit_pci}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+`fit_pci()` provides one interface for provider-level tests, empirical-null
+calibration, confidence intervals, and diagnostics. It takes summaries from an
+outcome model: estimates and standard errors, observed and expected counts,
+individual null probabilities, or precomputed scores. The outcome model and its
+covariance calculation remain the user's responsibility.
+
+```{r setup}
+library(EmpiNull)
+```
+
+## A complete first example
+
+Suppose a fitted model supplies observed and expected event counts for six
+providers. An observed/expected ratio of one is the reference. The following
+call calculates two-sided Poisson mid-p values and ratio intervals:
+
+```{r first-example}
+providers <- data.frame(
+  id = paste0("provider_", seq_len(6)),
+  observed = c(0, 8, 14, 23, 37, 61),
+  expected = c(3, 10, 15, 20, 25, 40)
+)
+pci <- fit_pci(
+  id = providers$id,
+  observed = providers$observed,
+  expected = providers$expected,
+  statistic = "poisson_midp",
+  calibration = "theoretical"
+)
+pci$results[, c("provider_id", "estimate", "p_value", "direction",
+                 "ci_lower", "ci_upper", "ci_scale")]
+pci$diagnostics$warning_codes
+```
+
+`direction` is -1 for a significantly lower result, +1 for a significantly
+higher result, and 0 otherwise. It describes the statistical direction, without
+assigning clinical desirability. The default significance level is 0.05, and
+intervals use confidence level `1 - alpha`. Tests are per provider: no
+multiple-testing adjustment is applied automatically.
+
+## Choose the statistic
+
+The `statistic` argument identifies the supplied information and initial test.
+Use `alternative = "two.sided"`, `"greater"`, or `"less"` to choose the tail.
+
+| `statistic` | Required input | Initial test |
+|:--|:--|:--|
+| `"z"` | `z` | Normal score supplied by the user |
+| `"p_value"` | `p_value`, `direction` | Supplied two-sided p-value converted to a signed normal score |
+| `"wald"` | `estimate`, `se` | Normal or Student-t test, optionally on the log/logit scale |
+| `"log_ratio"` | `estimate`, `se` | Log-ratio Wald test; SE is on the log scale by default |
+| `"poisson_midp"` | `observed`, `expected` | Poisson half-mass tails |
+| `"poisson_exact"` | `observed`, `expected` | Inclusive Poisson tails with the convention specified below |
+| `"poisson_score"` | `observed`, `expected` | Pearson score with a normal reference |
+| `"poibin"` | `observed`, `probabilities` | Distribution of a sum of independent Bernoulli variables |
+| `"binary_score"` | `observed`, `probabilities` | Standardized Bernoulli count with a normal reference |
+| `"resampling"` | `observed`, `probabilities` or `eta` | Monte Carlo Bernoulli-count tails, optionally integrating normal posterior effects |
+
+`"poibin_exact"` is an alias for `"poibin"`. Deterministic binary methods also
+accept `eta` and `re_mean`; these imply probabilities
+`plogis(reference + eta + re_mean)`, and require zero `re_var`.
+
+Provide one entry per provider for the primary input. Standard errors,
+references, degrees of freedom, and specified null parameters can be scalars
+or provider-length vectors. Observation-level input uses a list with one
+numeric vector per provider. For a single provider, a numeric vector is also
+accepted. `id` must contain unique nonmissing identifiers.
+
+## Choose the null calibration
+
+For estimated or fixed normal nulls, the function computes
+
+\[
+ Z_i^{\mathrm{adj}}=\frac{Z_i-\mu_i}{\sigma_i},\qquad
+ p_i=2\Phi(-|Z_i^{\mathrm{adj}}|)
+\]
+
+for a two-sided test. One-sided tests use the corresponding normal tail.
+
+| `calibration` | Meaning | Additional information |
+|:--|:--|:--|
+| `"theoretical"` | Preserve the initial test's tail probabilities | Default; includes t and discrete tails |
+| `"fixed"` | Use specified score means and SDs | `null_mean`, `null_sd` |
+| `"overall"` | Fit one common null distribution | Robust by default; likelihood via `control$estimator` |
+| `"groupwise"` | Fit robust means and SDs within groups | `size` and grouping options, or explicit `groups` |
+| `"individualized"` | Gaussian working null with variance `1 + size * phi` | Positive `size`; mean zero or fitted common intercept |
+| `"correlated"` | Gaussian working null with mean `sqrt(size) * X %*% zeta` and variance `1 + size * phi` | Positive `size`, optional `covariates` |
+| `"cre"` | Mean-zero Gaussian working null with variance `size * phi` | Positive `size` |
+| `"moment"` | Gaussian working null matched to Poisson-lognormal moments | Pearson scores, expected counts, and `second_moment`; optional `covariates` |
+
+The structured models use the estimators described in
+`?fit_empirical_null` and the package's empirical-null tutorial. An intercept
+is included by default for correlated and moment models. Choose the model
+according to its assumptions; a shared interface does not make all
+calibrations appropriate for every statistic.
+
+### Specified score SD versus an outcome benchmark
+
+`null_sd` is the SD of the provider-score distribution. `reference` is the
+outcome value being tested. They answer different questions and can be used
+together.
+
+```{r fixed-and-reference}
+# A specified score distribution with mean zero and SD 1.81.
+fixed <- fit_pci(z = c(-4, 0, 4), calibration = "fixed", null_sd = 1.81)
+fixed$results[, c("z_raw", "null_sd", "z_adjusted", "p_value")]
+
+# The corresponding two-sided 5% threshold on the raw-score scale.
+1.81 * qnorm(0.975)
+
+# A separate decision: test proportions against a 30% outcome benchmark.
+fit_pci(
+  estimate = c(0.2, 0.4), se = c(0.04, 0.06),
+  statistic = "wald", transform = "logit", reference = 0.3,
+  calibration = "fixed", null_sd = 1.81
+)$results
+```
+
+The value 1.81 is illustrative and is not a package default. It gives a raw
+two-sided 5% score cutoff of approximately 3.55. `null_sd = 1.81` does not mean
+that the tested rate or ratio equals 1.81.
+
+Theoretical calibration preserves the initial p-values. Fixed calibration
+with mean zero and SD one still passes through the score representation, so
+it can differ for discrete tails that reach a numerical score floor.
+
+### Overall and groupwise robust fitting
+
+```{r groupwise}
+set.seed(23)
+provider_size <- seq_len(200)
+provider_z <- rnorm(200, mean = 0.15, sd = 1.3)
+grouped <- fit_pci(
+  z = provider_z, size = provider_size,
+  calibration = "groupwise", n_groups = 4,
+  grouping = "quantile", psi = "huber"
+)
+grouped$null_parameters
+grouped$diagnostics$warning_codes
+```
+
+Robust fitting uses `MASS::rlm()` with an intercept and MAD scale estimate.
+`psi = "bisquare"` is the default; `"huber"` is also available. The same
+procedure is exposed directly by `empirical_null_groupwise()`.
+`calibration = "overall"` fits one robust null using all eligible providers;
+`calibration = "groupwise", n_groups = 1` also gives one group. Select the
+overall likelihood estimator using `control = list(estimator = "likelihood")`.
+
+Grouping and fit selection are explicit:
+
+- `grouping = "quantile"` uses right-closed size-quantile intervals. Tied
+  quantile breaks cause an error; reduce the number of groups or choose a
+  different grouping rule.
+- `grouping = "rank"` stably sorts providers by size and uses approximately
+  equal-count blocks. It can separate tied sizes and can produce fewer than
+  `n_groups` nonempty groups for some sample sizes.
+- `groups` supplies the group labels directly and takes precedence over
+  size-based grouping.
+- `fit_mask` selects providers for fitting robust means/scales. All complete
+  providers are still tested, including those excluded from fitting.
+- `common_mean = TRUE` replaces fitted means with the ordinary pooled mean of
+  eligible finite scores. A numeric `common_mean` sets that mean explicitly.
+  The previously fitted group scales are retained.
+
+The minimum eligible group size is three by default. Small groups cause an
+error unless `control = list(small_group = "theoretical")` requests a recorded
+fallback to mean zero and SD one. A nonpositive fitted scale remains an error.
+Fitting exclusions and `common_mean` apply only to robust overall/groupwise
+modes. Structured likelihood modes require all retained providers.
+
+## Estimate scales and standard errors
+
+With `statistic = "wald"`, `transform` selects the working scale. The input
+estimate and reference always remain on the original scale:
+
+| Transformation | Valid estimates/references | Default reference | SE conversion when `se_scale = "original"` |
+|:--|:--|:--|:--|
+| `"identity"` | Finite real values | 0 | `se` |
+| `"log"` | Positive values | 1 | `se / estimate` |
+| `"logit"` | Proportions strictly between 0 and 1 | 0.5 | `se / (estimate * (1 - estimate))` |
+
+For example, a 20% rate is entered as `0.2`, not `20`. If the SE is already on
+the working scale, use `se_scale = "transformed"`. The `"log_ratio"` shortcut
+defaults to the log transform and a transformed SE.
+
+```{r ratio-and-supplied-test}
+ratio_fit <- fit_pci(
+  estimate = c(0.8, 1.4), se = c(0.15, 0.20),
+  statistic = "log_ratio", reference = 1,
+  calibration = "fixed", null_mean = 0.2, null_sd = 1.3
+)
+ratio_fit$results[, c("estimate", "p_value", "ci_lower", "ci_upper")]
+
+# A supplied two-sided model test, with the direction of each estimate.
+fit_pci(
+  p_value = c(0.01, 0.2), direction = c(-1, 1),
+  statistic = "p_value", calibration = "fixed", null_sd = 1.3
+)$results[, c("z_raw", "z_adjusted", "p_value")]
+```
+
+For a positive ratio with normal Wald inference, a two-sided calibrated
+interval is
+
+\[
+\exp\{\log(\widehat R)-\mu s\ \mathbin{\pm}
+      \Phi^{-1}(1-\alpha/2)\sigma s\},
+\]
+
+where \(s\) is the log-scale SE. Use `df` for Student-t Wald inference; finite
+t statistics are converted to normal quantiles before calibration, and
+intervals invert that transformation. A supplied two-sided p-value plus
+direction is assumed to follow a symmetric-tail convention if a one-sided
+alternative is requested.
+
+For a zero ratio, `zero_method = "score"` uses `-1 / se`, requiring a
+transformed SE and reference one. Its linear upper interval bound is an
+approximation recorded as `ZERO_RATIO_SCORE_APPROXIMATION`.
+`zero_method = "exclude"` leaves the row present with undefined inference.
+
+## Poisson tails and the two-sided mid-p factor
+
+For provider \(i\), let \(O_i\) be observed events, \(E_i\) be the baseline
+expected count, and \(r_0\) be the ratio reference. The null count distribution
+is \(X_i\sim\mathrm{Poisson}(E_i r_0)\). Define
+
+\[
+L_i=P(X_i<O_i)+\tfrac12 P(X_i=O_i),\qquad
+U_i=P(X_i>O_i)+\tfrac12 P(X_i=O_i).
+\]
+
+The two-sided mid-p is
+
+\[
+p_i^{\mathrm{mid}}=2\min(L_i,U_i).
+\]
+
+Since \(L_i+U_i=1\), this lies between zero and one without upper clipping.
+If tails are instead written as \(q_i^l=2L_i\) and \(q_i^u=2U_i\), the same
+two-sided p-value is \(\min(q_i^l,q_i^u)\), **without division by two**.
+Half-mass tails are not guaranteed to give conservative exact test size.
+
+```{r direct-mid-p}
+observed <- 13
+expected <- 7.385
+lower_mid <- ppois(observed - 1, expected) + 0.5 * dpois(observed, expected)
+upper_mid <- ppois(observed, expected, lower.tail = FALSE) +
+  0.5 * dpois(observed, expected)
+direct_p <- 2 * min(lower_mid, upper_mid)
+calculated <- fit_pci(
+  observed = observed, expected = expected, statistic = "poisson_midp"
+)
+data.frame(direct_p = direct_p, fit_pci_p = calculated$results$p_value)
+```
+
+`"poisson_exact"` uses inclusive tails and a specific two-sided convention:
+double the upper tail when `observed > expected * reference`, otherwise double
+the lower tail, then cap at 0.999. This is not the probability-ordering
+definition used by some other exact-test functions. Under a deterministic
+zero-mean null with zero observed events, the two-sided p-value is one.
+One-sided `"poisson_midp"` always uses half-mass tails; the `mid_p` argument
+does not change the named Poisson methods.
+
+`expected` stays on its baseline scale. Changing `reference` changes the null
+mean to `expected * reference`; ratio intervals continue to divide by baseline
+`expected`. A zero expected count has no defined observed/expected ratio
+interval.
+
+### Pearson scores and the moment model
+
+`"poisson_score"` uses \((O_i-E_i r_0)/\sqrt{E_i r_0}\). For
+`calibration = "moment"`, the reference must be one, `size` equals `expected`,
+and `second_moment` contains
+\(E_i^{(2)}=\sum_j \lambda_{ij}^2\), where
+\(E_i=\sum_j\lambda_{ij}\). In general \(E_i^{(2)}\ne E_i^2\).
+
+Alternatively supply Pearson scores as `statistic = "z"` with
+`control = list(score_type = "pearson")`, along with `size = E` and
+`second_moment = E2`. Mid-p scores are not valid inputs for this moment model.
+The model has exact moment expressions but uses a Gaussian working
+distribution for tail inference.
+
+## Binary outcomes and resampling
+
+For each provider, `probabilities` contains the individual Bernoulli null
+probabilities. `"poibin"` computes their count distribution using dynamic
+programming. Values zero and one retain their deterministic meaning.
+`"binary_score"` uses
+
+\[
+\frac{O_i-\sum_j p_{ij}}
+     {\sqrt{\sum_j p_{ij}(1-p_{ij})}}.
+\]
+
+```{r binary}
+null_probabilities <- list(c(0.1, 0.2, 0.4, 0.6), rep(0.2, 12))
+binary <- fit_pci(
+  observed = c(2, 4), probabilities = null_probabilities,
+  statistic = "poibin"
+)
+binary$results[, c("p_value", "ci_lower", "ci_upper", "ci_scale")]
+
+simulated <- fit_pci(
+  observed = c(2, 4), probabilities = null_probabilities,
+  statistic = "resampling", control = list(n_resample = 2000, seed = 7)
+)
+simulated$results[, c("p_raw", "p_value")]
+```
+
+Two-sided Poisson-binomial and resampling tests use half-mass tails by default;
+`mid_p = FALSE` uses inclusive tails and clips the doubled smaller tail at one.
+One-sided binary tests use inclusive tails unless
+`control = list(one_sided_midp = TRUE)`. The `mid_p` switch does not alter the
+normal-tail `"binary_score"` test.
+
+Resampling can instead integrate specified normal posterior effects. Supply
+`eta`, excluding the effect under test, and optional `re_mean` and `re_var`
+lists. For each replicate the method draws independent effects
+\(b_{ij}\sim N(m_{ij},v_{ij})\), then independent outcomes with probability
+\(\operatorname{logit}^{-1}(\eta_{ij}+r_0+b_{ij})\). Here `reference` is the
+additive log-odds effect \(r_0\), default zero.
+
+```{r posterior-resampling}
+posterior <- fit_pci(
+  observed = c(2, 4), statistic = "resampling",
+  eta = lapply(null_probabilities, qlogis),
+  re_mean = lapply(null_probabilities, function(p) rep(0, length(p))),
+  re_var = lapply(null_probabilities, function(p) rep(0.1, length(p))),
+  reference = 0,
+  control = list(n_resample = 2000, seed = 7)
+)
+posterior$results[, c("p_value", "direction")]
+```
+
+This sampling model uses one independent effect per observation per replicate;
+it does not draw a shared provider effect or a joint posterior covariance.
+Increasing `n_resample` reduces simulation variability but changes the realized
+tail estimate. Monte Carlo proportions may be zero; no plus-one correction or
+simulation-uncertainty interval is applied. The seed is reproducible and the
+caller's random-number state is restored.
+
+## Confidence intervals
+
+`ci = "auto"` chooses the following methods. Use `ci = "none"` when only
+tests are needed.
+
+| Statistic/calibration | Automatic interval | Reported scale |
+|:--|:--|:--|
+| Wald or log-ratio | Invert the normal/t working-scale cutoffs and back-transform | Original estimate, ratio, or rate |
+| Poisson exact + theoretical | Garwood if expected count is below 100; Byar otherwise | Observed/expected ratio |
+| Other Poisson combinations | Invert the selected score with null parameters held fixed | Observed/expected ratio |
+| Poisson-binomial or binary score | Invert the count test/score over a common log-odds shift | `log_odds_shift` |
+| Supplied Z/p-value or resampling | No automatic original-scale interval | Missing |
+
+For theoretical Poisson inference, `ci = "poisson"` explicitly requests the
+classical Garwood/Byar method. If paired with a different Poisson statistic,
+the diagnostic `INTERVAL_METHOD_DIFFERS_FROM_TEST` records that choice.
+`ci = "invert"` is available for Poisson and deterministic binary methods.
+
+A binary interval varies a common shift \(\delta\) through
+`plogis(qlogis(p) + delta)`. It is not automatically an interval for a
+standardized rate or observed/expected ratio. With heterogeneous probabilities,
+the binary score can be nonmonotone in this shift. A numerical derivative check
+withholds a single interval when nonmonotonicity is detected and records
+`NONMONOTONE_SCORE_INVERSION`. This is a numerical guard, not a proof of
+monotonicity for every input; Poisson-binomial tails provide monotone inversion.
+
+All calibrated intervals hold fitted null parameters fixed. Their estimation
+uncertainty is not propagated. One-sided intervals have the appropriate
+unbounded or natural-boundary endpoint. A finite root-search limit does not
+establish that an endpoint is infinite.
+
+## Controls, returned values, and diagnostics
+
+The `control` list accepts named settings. Defaults and scope are summarized
+below; `?fit_pci` documents the full interface.
+
+| Control | Default | Use |
+|:--|:--|:--|
+| `estimator` | `"robust"` | Overall estimator; groupwise supports robust only |
+| `maxit`, `acc` | 1000, `1e-8` | Robust iteration limit and convergence tolerance |
+| `tuning` | Huber 1.345; bisquare 4.685 | Robust influence-function tuning |
+| `min_group_size`, `small_group` | 3, `"error"` | Minimum fit sample and optional `"theoretical"` fallback |
+| `p_grid`, `phi_bounds`, `cutoff` | Model-specific | Structured likelihood estimation; see `?fit_empirical_null` |
+| `include_intercept` | `TRUE` | Correlated/moment design matrix |
+| `common_intercept` | `FALSE` | Common mean for individualized calibration |
+| `p_floor` | `1e-6` | One-sided tail floor for discrete normal-score conversion |
+| `seed`, `n_resample` | 1, 10000 | Resampling |
+| `one_sided_midp` | `FALSE` | One-sided binary tail convention |
+| `normal_threshold` | 100 | Expected-count switch from Garwood to Byar limits |
+| `upper_cap`, `root_tol` | `1e8`, `1e-8` | Poisson search cap and inversion tolerance |
+| `max_log_odds` | 40 | Absolute finite search limit for binary inversion |
+
+The score floor acts on a **one-sided tail used to form a normal score**, not
+on the reported raw two-sided p-value. Theoretical calibration preserves raw
+tails. Estimated/fixed calibration uses the finite score and can therefore
+limit extreme-tail resolution. Exact zero supplied p-values also need a
+finite-score convention. A requested calibrated cutoff beyond the attainable
+score range is reported as `SCORE_FLOOR_LIMITS_INVERSION`.
+
+The result is an object of class `fit_pci`:
+
+- `results` contains one row per input provider. Key columns are `z_raw`,
+  `p_raw`, `null_mean`, `null_sd`, `z_adjusted`, `p_value`, `direction`, and
+  `ci_lower`, `ci_upper`, `ci_scale`. `statistic_value` retains the initial
+  test statistic, and `df` records Wald degrees of freedom.
+- `included` marks providers with defined scores; `used_for_null` records fit
+  selection. With `na_action = "omit"`, incomplete rows and identifiers stay
+  present with missing calculated results.
+- `null_fit` and `null_parameters` expose the fitted estimator and calibration
+  parameters. `as.data.frame(pci)` returns `pci$results`.
+- `diagnostics` contains warning codes, omitted identifiers, fit details,
+  interval failures, and interpretation notes.
+- `method`, `statistic_details`, `call`, and `package_version` record the
+  selected methods and relevant inputs/settings.
+
+Inspect `diagnostics$warning_codes` and `diagnostics$intervals` before using the
+results. Codes distinguish missing inputs, undefined scores, small-group
+fallbacks, nonconvergence, normal-score floors, empty confidence sets, and
+failed numerical searches. Undefined or failed intervals remain missing.
+
+Outcome-model uncertainty enters only through the supplied inputs. The
+function does not recompute model covariance matrices, refit likelihood-ratio
+tests, or identify latent patient-level confounding. Structured null
+parameters describe a provider-level working distribution; substantive and
+causal interpretation requires additional assumptions outside this interface.

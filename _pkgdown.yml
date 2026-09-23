@@ -1,0 +1,38 @@
+url: https://xgfang.github.io/Empirical_Null/
+template:
+  bootstrap: 5
+home:
+  title: EmpiNull
+  description: Empirical-null calibration and post-model provider inference in R.
+articles:
+  - title: User guides
+    navbar: ~
+    contents:
+      - fit_pci
+      - tutorial
+reference:
+  - title: Post-model inference
+    contents:
+      - fit_pci
+  - title: Structured empirical-null fitting
+    contents:
+      - fit_empirical_null
+      - standardize_empirical_null
+      - flag_empirical_null
+      - audit_empirical_null
+      - predict.empinull_fit
+      - poisson_null_moments
+  - title: Lower-level methods
+    contents:
+      - cal_Z_htaz
+      - empirical_null_groupwise
+      - empirical_null_overall
+      - empirical_null_ind_RQ
+      - empirical_null_ind_CF
+      - empirical_null_ind_CF_CRE
+      - empirical_null_ind_pois
+      - empirical_null_ind_CF_pois
+      - empirical_null_CF_prov
+  - title: Package overview
+    contents:
+      - EmpiNull-package

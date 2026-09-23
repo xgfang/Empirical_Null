@@ -1,0 +1,346 @@
+---
+title: "Empirical-null models and diagnostics"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Empirical-null models and diagnostics}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>")
+library(EmpiNull)
+```
+
+EmpiNull estimates reference distributions for provider-level test statistics.
+An empirical null can account for a shared shift, extra spread, or relationships
+with provider size and measured provider summaries. The package works after the
+primary outcome model has been fitted: it does not fit that model or reconstruct
+its standard errors from patient records.
+
+Use `fit_pci()` for tests, null calibration, and supported confidence intervals
+in one result. Use `fit_empirical_null()` when your main interest is a structured
+null model and its diagnostics. This article explains the calibration models;
+the `fit_pci` article describes the testing interface, input scales, and
+interval choices.
+
+## What is being estimated?
+
+Let $z_i$ be the statistic for provider $i$. A Gaussian working null specifies
+
+$$Z_i \mid H_{0i} \sim N(\mu_i,\sigma_i^2).$$
+
+For Gaussian calibration, the corrected score and its two-sided p-value are
+
+$$z_i^{\mathrm{adj}}=\frac{z_i-\widehat\mu_i}{\widehat\sigma_i},
+\qquad p_i=2\Phi(-|z_i^{\mathrm{adj}}|).$$
+
+With theoretical calibration, `fit_pci()` preserves the selected raw test's
+p-value, including discrete or finite-degrees-of-freedom tests. The normal-tail
+formula above describes empirical or fixed Gaussian calibration.
+
+The direction depends on the original statistic. Positive scores can represent
+higher rates, larger effects, or another quantity defined by the primary model;
+they do not automatically mean better performance.
+
+The fit describes a provider-level reference distribution. It does not identify
+an unmeasured patient characteristic, prove that confounding has been removed, or
+separate a causal quality effect from every other source of variation.
+Calibration is useful only when the chosen null structure reasonably describes
+the providers being compared.
+
+## Available calibration models
+
+Here $s_i>0$ is `size`, $x_i$ is a row of the provider design matrix, and $g(i)$
+identifies a group.
+
+| Model | Null mean $\mu_i$ | Null variance $\sigma_i^2$ | Entry point |
+|:--|:--|:--|:--|
+| Theoretical | $0$ | $1$ | `fit_pci(calibration = "theoretical")` |
+| Fixed | Supplied `null_mean` | Supplied `null_sd` squared | `fit_pci(calibration = "fixed")` |
+| Overall | Shared estimated $\mu$ | Shared estimated $\sigma^2$ | Both interfaces |
+| Groupwise | Estimated $\mu_{g(i)}$ | Estimated $\sigma_{g(i)}^2$ | `fit_pci(calibration = "groupwise")` |
+| Individualized | $0$, or an optional common mean | $1+\phi s_i$ | Both interfaces |
+| Correlated | $\sqrt{s_i}\,x_i^\top\zeta$ | $1+\phi s_i$ | Both interfaces |
+| CRE | $0$ | $\phi s_i$ | Both interfaces |
+| Poisson moment | Poisson-lognormal score mean | Poisson-lognormal score variance | Both interfaces |
+
+`null_sd` values are **standard deviations**. `phi`, `sigmaAlpha2`, and
+`sigmaEps2` are **variance components**. For example, the individualized model
+uses `sqrt(1 + size * phi)` as its null SD, not `1 + size * phi` and not
+`sqrt(1 + size * phi^2)`.
+
+For the correlated model, the default intercept is a column in $x_i$. Its
+contribution is $\sqrt{s_i}\zeta_0$, which differs from a shared constant mean.
+To estimate a constant mean with individualized variance through `fit_pci()`,
+set `control = list(common_intercept = TRUE)`.
+
+`fit_empirical_null(model = "auto")` chooses `"moment"` for
+`family = "poisson"`; for `family = "gaussian"`, it chooses `"individualized"`
+without covariates and `"correlated"` with covariates. This is an input-based
+selection rule, not a test of which model fits best. Specifying the model
+explicitly makes an analysis easier to review.
+
+## Robust overall and groupwise calibration
+
+Robust calibration estimates an intercept and residual scale with `MASS::rlm()`.
+`psi = "bisquare"` is the default; `psi = "huber"` is also available. The scale
+estimate uses MAD. These are Gaussian calibrations with robust parameter
+estimation, not distribution-free tests.
+
+This example creates 360 providers, with larger null spread among larger
+providers and a small set of shifted providers.
+
+```{r groupwise}
+set.seed(2026)
+m <- 360L
+provider_size <- seq(20, 400, length.out = m)
+z <- rnorm(m, mean = 0.15, sd = sqrt(1 + 0.008 * provider_size))
+z[seq(12, m, by = 24)] <- z[seq(12, m, by = 24)] + 5
+
+group_fit <- fit_pci(
+  z = z, calibration = "groupwise", size = provider_size,
+  n_groups = 4, psi = "huber"
+)
+group_fit$null_parameters
+head(group_fit$results[, c("provider_id", "group", "null_mean", "null_sd",
+                          "z_adjusted", "p_value", "direction")])
+group_fit$diagnostics$warning_codes
+```
+
+By default, groups follow size quantiles. If ties produce repeated quantile
+boundaries, reduce `n_groups`, use `grouping = "rank"`, or supply `groups`.
+Rank grouping can split equal sizes; ties follow input order. It uses blocks of
+size `ceiling(m / n_groups)`, so the final block may be smaller and fewer than
+`n_groups` groups can result.
+
+Each group needs at least three eligible providers by default. This is a
+computational minimum, not evidence of stable estimation with three providers.
+`control$min_group_size` can enforce a larger minimum. The default is to fail for
+a small group; `control = list(small_group = "theoretical")` explicitly uses
+$N(0,1)$ for such a group and records a diagnostic warning.
+
+`fit_mask` selects providers used to fit robust overall or groupwise nulls.
+Excluded providers still receive test results. Choose exclusions from the study
+design or other defensible information; choosing them to obtain preferred flags
+changes the meaning of the analysis.
+
+Each group has its own fitted mean by default. `common_mean = 0` fixes all means
+to zero; `common_mean = TRUE` uses the arithmetic mean of all eligible finite
+scores. Group-specific scales are retained without refitting. This pooled
+arithmetic mean is not itself a robust location estimate.
+
+For one shared robust null, use
+`fit_pci(z = z, calibration = "overall")`.
+
+## Structured likelihood models
+
+The overall likelihood, individualized, correlated, CRE, and Poisson moment
+models estimate parameters using a central region of the score distribution.
+A mixture formulation allows a null proportion $p_0$ and assumes that the
+central region is dominated by null or near-null providers. The likelihood uses
+scores inside the region and the probability of being outside it; it does not
+simply discard outside observations.
+
+`p_grid` supplies candidate null proportions. Its default in the unified
+interfaces is `seq(0.5, 0.995, by = 0.005)`. `cutoff` controls the coverage used
+to initialize provider-specific central intervals for structured models. The
+overall likelihood model instead uses a median/IQR-based interval. Estimates
+can be sensitive to the central region, search range, and signal contamination.
+
+The overall model differs between the entry points:
+
+* `fit_pci(calibration = "overall")` uses robust estimation by default.
+* `fit_pci(calibration = "overall", control = list(estimator = "likelihood"))`
+  uses likelihood estimation.
+* `fit_empirical_null(model = "overall")` uses likelihood estimation.
+
+Robust models do not estimate `p0`. In likelihood models, `p0` is a mixture
+parameter. It is not a provider-specific probability of being null, a local
+false discovery rate, or a multiple-testing adjustment.
+
+### Individualized and covariate-dependent calibration
+
+Use a continuous size model when its mean/variance relationship is supported by
+the original score and application. `size` is an effective information measure:
+it need not be patient count, and it should not be replaced by another size
+measure without checking the model.
+
+Here is a synthetic correlated-null example. The modest grid makes the example
+quick; a substantive analysis should check sensitivity to the grid and bounds.
+
+```{r correlated}
+set.seed(81)
+m <- 300L
+size <- runif(m, 20, 180)
+case_mix <- cbind(case_mix = rnorm(m))
+mu <- sqrt(size) * (0.03 + 0.04 * case_mix[, 1])
+z_structured <- rnorm(m, mu, sqrt(1 + 0.012 * size))
+
+null_fit <- fit_empirical_null(
+  z = z_structured, size = size, covariates = case_mix,
+  family = "gaussian", model = "correlated",
+  p_grid = c(0.80, 0.90, 0.95, 0.99), phi_bounds = c(0, 0.1)
+)
+null_fit$parameters
+head(predict(null_fit))
+head(flag_empirical_null(null_fit))
+audit_empirical_null(null_fit)$diagnostics$warning_codes
+```
+
+An intercept is added unless the design already has a constant column or
+`include_intercept = FALSE`. Covariates must be numerical, have one row per
+provider, and form an identifiable design. Centering/scaling nonconstant
+covariates can help conditioning and interpretation.
+
+The same model is available from the testing interface:
+
+```{r correlated-pci}
+pci_fit <- fit_pci(
+  z = z_structured, calibration = "correlated", size = size,
+  covariates = case_mix,
+  control = list(p_grid = c(0.80, 0.90, 0.95, 0.99),
+                 phi_bounds = c(0, 0.1))
+)
+head(pci_fit$results[, c("provider_id", "null_mean", "null_sd",
+                        "z_adjusted", "p_value")])
+```
+
+Without a covariate-dependent mean, use `model = "individualized"` or
+`calibration = "individualized"`. The CRE model uses variance $\phi s_i$,
+**without the additive 1**. Use it only for a score whose derivation supports
+this variance structure. Choosing `"cre"` does not fit a correlated random-effects
+outcome model or automatically remove mean bias.
+
+`predict()` returns null parameters for the fitted providers; it does not accept
+new covariates for out-of-sample prediction. Replacement `z` values in
+`standardize_empirical_null()` or `flag_empirical_null()` must correspond to
+the same providers in the same order.
+
+## Poisson-lognormal moment calibration
+
+This model is designed for the Pearson score
+
+$$Z_i=\frac{O_i-E_i}{\sqrt{E_i}}, \qquad E_i=\sum_j r_{ij},$$
+
+where $r_{ij}>0$ are expected contributions from the primary risk model. The
+additional input is $E_i^{(2)}=\sum_j r_{ij}^2$. `second_moment` is this sum of
+squared contributions, not $E_i^2$, the variance of $E_i$, or a second count
+outcome. Preserve it when aggregating primary model output.
+
+For the working model
+$\lambda_{ij}=r_{ij}\exp(x_i^\top\zeta+a_i+\varepsilon_{ij})$, let
+$a_i\sim N(0,A)$ be a shared provider effect and
+$\varepsilon_{ij}\sim N(0,B)$ independent patient effects, independent of $a_i$.
+Counts are conditionally independent Poisson given these effects. Define
+$M_i=\exp\{x_i^\top\zeta+(A+B)/2\}$. The score moments are
+
+$$\mu_i=\sqrt{E_i}(M_i-1),$$
+
+$$\sigma_i^2=M_i+M_i^2\left[
+   (e^A-1)E_i+e^A(e^B-1)\frac{E_i^{(2)}}{E_i}
+\right].$$
+
+`sigmaAlpha2` is $A$ and `sigmaEps2` is $B$. These moments are exact under the
+specified model, but the Gaussian distribution used for calibration is a
+**moment-matched working null**. It is not an exact Poisson test or an exact
+Poisson-lognormal distribution.
+
+This reproducible construction retains both required summaries:
+
+```{r poisson-moments}
+set.seed(92)
+m <- 240L
+n <- sample(30:100, m, replace = TRUE)
+expected_contributions <- lapply(n, function(ni) {
+  exp(rnorm(ni, mean = -0.5, sd = 0.6))
+})
+E <- vapply(expected_contributions, sum, numeric(1))
+E2 <- vapply(expected_contributions, function(x) sum(x^2), numeric(1))
+X <- cbind("(Intercept)" = 1, case_mix = rnorm(m))
+
+working_moments <- poisson_null_moments(
+  Xbar = X, E = E, E2 = E2, zeta = c(0.02, 0.03),
+  sigmaAlpha2 = 0.005, sigmaEps2 = 0.02
+)
+head(data.frame(mean = working_moments$mean, sd = working_moments$sd))
+```
+
+To fit from observed counts, the testing interface constructs a Pearson score.
+Here counts are simulated under a simple Poisson null to illustrate the input
+contract; the example does not establish recovery of nonzero variance components.
+
+```{r poisson-fit}
+O <- rpois(m, E)
+moment_fit <- fit_pci(
+  observed = O, expected = E, statistic = "poisson_score",
+  calibration = "moment", covariates = X, second_moment = E2,
+  ci = "none", control = list(p_grid = c(0.80, 0.90, 0.95, 0.99))
+)
+moment_fit$null_parameters
+moment_fit$diagnostics$warning_codes
+```
+
+The example may select the largest candidate `p0`, producing
+`P0_AT_SEARCH_BOUNDARY`. All counts here were generated under a null model, so
+the behavior illustrates why a boundary diagnostic needs interpretation rather
+than automatic dismissal of the result.
+
+For this route, `size` defaults to `expected` and the reference ratio must be 1.
+Alternatively, pass the Pearson score to `fit_empirical_null()` with
+`family = "poisson"`, `model = "moment"`, `size = E`, and
+`second_moment = E2`. A mid-p normal score is a different statistic and must not
+be substituted into these moment formulas. For supplied `z`, `fit_pci()` requires
+`control = list(score_type = "pearson")` to make that requirement explicit.
+
+Separate identification of $A$ and $B$ depends on variation in $E_i$ and
+$E_i^{(2)}/E_i$. Strongly related summaries can produce unstable component
+estimates even when fitted null means and standard deviations seem plausible.
+
+## Reading diagnostics
+
+Inspect diagnostics before interpreting flags. `fit_empirical_null()` returns
+`status`, `diagnostics`, and `low_level_fit`; `audit_empirical_null()` collects
+estimates, assumptions, and diagnostics. `fit_pci()` returns `diagnostics` and
+retains the fitted model in `null_fit`.
+
+| Diagnostic code | What to investigate |
+|:--|:--|
+| `OPTIMIZATION_FAILED` / `ROBUST_DID_NOT_CONVERGE` | Convergence, data scale, and starting model assumptions. |
+| `P0_AT_SEARCH_BOUNDARY` | Sensitivity to candidate null proportions and the central-region assumption. |
+| `PHI_AT_SEARCH_BOUNDARY` | Restrictive variance search bounds or a fit favoring a boundary. |
+| `ILL_CONDITIONED_DESIGN` / `FEW_PROVIDERS_PER_PARAMETER` | Redundant covariates, limited information, and overparameterization. |
+| `SMALL_CENTRAL_SAMPLE` / `CENTRAL_SKEWNESS` | Whether enough central observations support a roughly symmetric working null. |
+| `POISSON_VARIANCE_COMPONENTS_WEAKLY_IDENTIFIED` | Whether expected-count summaries distinguish the two variance components. |
+
+These thresholds are screening rules, not formal model-selection tests. A
+warning can occur in a useful fit, and a warning-free fit does not prove correct
+calibration. The central mean and SD describe a truncated subset; its SD is not
+expected to be 1 even under a correct normal model. Size-subgroup summaries use
+all standardized scores and can reflect outliers as well as poor calibration.
+
+Compare reasonable specifications and inspect score distributions by provider
+size. Report the statistic, reference, size definition, covariates, calibration
+method, tuning/search settings, and diagnostic codes. Tests and intervals treat
+fitted null parameters as given; they do not propagate their estimation
+uncertainty. Reported p-values are unadjusted for multiple testing.
+
+## Lower-level functions
+
+Original estimators remain exported for analyses that need their specific
+controls. Return structures and default grids differ between functions.
+
+| Function | Role |
+|:--|:--|
+| `empirical_null_overall()` | Overall likelihood null. |
+| `empirical_null_groupwise()` | Robust size-stratified null. |
+| `empirical_null_ind_RQ()` | Individualized variance, with optional constant mean. |
+| `empirical_null_ind_CF()` | Covariate-dependent mean and individualized variance. |
+| `empirical_null_ind_CF_CRE()` | Zero-mean CRE variance model. |
+| `empirical_null_ind_CF_pois()` | Simplified Poisson calibration using expected counts as size. |
+| `empirical_null_ind_pois()` | Poisson-lognormal moment calibration. |
+| `empirical_null_CF_prov()` | Specialized count-based estimator with observed provider covariates and coefficient covariance estimates. |
+
+The last specialized estimator is not a separate `fit_pci()` calibration option.
+See each function's help for its input contract. The unified interfaces provide
+consistent results for supported models without removing lower-level functions.
